@@ -159,6 +159,7 @@ class VideoProcessRequest(BaseModel):
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     loop_video: bool = False
+    output_type: str = "audio"  # Options: "audio", "video", "full_video"
 
 class PreviewRequest(BaseModel):
     youtube_url: str
@@ -216,7 +217,8 @@ async def process_video(request: VideoProcessRequest, background_tasks: Backgrou
         request.start_time,
         request.end_time,
         request.loop_video,
-        request.video_url
+        request.video_url,
+        request.output_type
     )
 
     return JobStatus(job_id=job_id, status="queued")
@@ -232,7 +234,8 @@ def process_video_task(
     start_time: Optional[str],
     end_time: Optional[str],
     loop_video: bool,
-    video_url: Optional[str] = None
+    video_url: Optional[str] = None,
+    output_type: str = "audio"
 ):
     try:
         # Update job status
@@ -317,23 +320,37 @@ def process_video_task(
             print(f"Error applying effects: {str(e)}")
             raise Exception(f"Error applying effects: {str(e)}")
 
-        # Handle video if needed
-        output_file = os.path.join(OUTPUT_DIR, f"{job_id}.mp3")
+        # Handle different output types
+        output_file = os.path.join(OUTPUT_DIR, f"{job_id}.mp3")  # Default output is audio
 
         try:
             # Determine which URL to use for video
             video_source_url = video_url if video_url else youtube_url
 
-            if loop_video and start_time and end_time:
-                # Download and trim video
+            # Process based on output type
+            if output_type == "audio":
+                # Just copy the processed audio to output
+                print(f"Output type: audio - Copying processed audio to {output_file}")
+                shutil.copy(processed_audio, output_file)
+
+                # Ensure file has proper permissions
+                try:
+                    import stat
+                    os.chmod(output_file, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+                    print(f"Set permissions on {output_file}")
+                except Exception as e:
+                    print(f"Warning: Could not set permissions on output file: {str(e)}")
+
+            elif output_type == "video" and loop_video and start_time and end_time:
+                # Download and trim video, then combine with processed audio
                 video_file = os.path.join(job_dir, "video.mp4")
-                print(f"Downloading video from {video_source_url} with time range {start_time}-{end_time}")
+                print(f"Output type: video - Downloading video from {video_source_url} with time range {start_time}-{end_time}")
                 download_video(video_source_url, video_file, start_time, end_time)
 
                 # Combine audio and video
                 # Remove extension from job_id to prevent double extension
                 output_file = os.path.join(OUTPUT_DIR, f"{job_id}")
-                print(f"Combining audio and video to {output_file}")
+                print(f"Combining processed audio and video to {output_file}")
 
                 try:
                     # Make sure the output directory exists
@@ -377,8 +394,80 @@ def process_video_task(
                     output_file = os.path.join(OUTPUT_DIR, f"{job_id}.mp3")
                     print(f"Falling back to audio-only output: {output_file}")
                     shutil.copy(processed_audio, output_file)
+
+            elif output_type == "full_video":
+                # Download full video and combine with processed audio
+                video_file = os.path.join(job_dir, "full_video.mp4")
+                print(f"Output type: full_video - Downloading full video from {video_source_url}")
+
+                # Download full video without trimming
+                cmd = [
+                    "yt-dlp",
+                    "-f", "bestvideo[ext=mp4]",
+                    "-o", video_file,
+                    video_source_url
+                ]
+
+                print(f"Running command: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
+                if result.returncode != 0:
+                    print(f"yt-dlp error: {result.stderr}")
+                    raise Exception(f"Error downloading full video: {result.stderr}")
+
+                # Verify the file exists
+                if not os.path.exists(video_file):
+                    # Try to find any mp4 file in the directory
+                    mp4_files = [f for f in os.listdir(job_dir) if f.endswith('.mp4')]
+                    if mp4_files:
+                        video_file = os.path.join(job_dir, mp4_files[0])
+                        print(f"Found video file: {video_file}")
+                    else:
+                        raise Exception("Video file not found after download")
+
+                # Combine audio and video
+                output_file = os.path.join(OUTPUT_DIR, f"{job_id}")
+                print(f"Combining processed audio and full video to {output_file}")
+
+                try:
+                    # Make sure the output directory exists
+                    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
+                    # Combine the audio and video
+                    combine_audio_video(processed_audio, video_file, output_file)
+
+                    # Verify the file exists with or without extension
+                    if os.path.exists(output_file):
+                        print(f"Successfully created full video file: {output_file}")
+                    elif os.path.exists(output_file + ".mp4"):
+                        output_file = output_file + ".mp4"
+                        print(f"Found full video file with .mp4 extension: {output_file}")
+                    else:
+                        # Check for any file in the output directory that starts with the job_id
+                        matching_files = [f for f in os.listdir(OUTPUT_DIR) if f.startswith(job_id)]
+                        if matching_files:
+                            output_file = os.path.join(OUTPUT_DIR, matching_files[0])
+                            print(f"Found matching output file: {output_file}")
+                        else:
+                            print(f"No matching output files found for job_id: {job_id}")
+                            raise Exception(f"Failed to create output video file at {output_file}")
+
+                    # Ensure file has proper permissions
+                    try:
+                        import stat
+                        os.chmod(output_file, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+                        print(f"Set permissions on {output_file}")
+                    except Exception as e:
+                        print(f"Warning: Could not set permissions on output file: {str(e)}")
+                except Exception as e:
+                    print(f"Error combining audio and full video: {str(e)}")
+                    # Fallback to just using the audio file
+                    output_file = os.path.join(OUTPUT_DIR, f"{job_id}.mp3")
+                    print(f"Falling back to audio-only output: {output_file}")
+                    shutil.copy(processed_audio, output_file)
             else:
-                # Just copy the processed audio to output
+                # Default to audio output if output type is not recognized or video options not provided
+                print(f"Using default audio output for output_type={output_type}")
                 print(f"Copying processed audio to {output_file}")
                 shutil.copy(processed_audio, output_file)
 
